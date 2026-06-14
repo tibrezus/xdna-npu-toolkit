@@ -32,6 +32,23 @@ xdna-embed info        # NPU device + backend status
 | `list`   | —                          | registered models + which run on the NPU            |
 | `info`   | —                          | NPU device, perms, memlock, compiled models         |
 
+## Models
+
+Registered models with NPU support (compiled bf16 GEMM kernels):
+
+| alias | model | dim | pooling | NPU |
+|---|---|---|---|---|
+| `minilm` | all-MiniLM-L6-v2 | 384 | mean | bert384 |
+| `bge-small` | BAAI/bge-small-en-v1.5 | 384 | cls | bert384 |
+| `e5-small` | intfloat/e5-small-v2 | 384 | mean | bert384 |
+| `qwen3-0.6b` | Qwen3-Embedding-0.6B | 1024 | last_token | qwen |
+
+**The three bert384 models share ONE set of compiled GEMM kernels** (identical
+shapes: qkv 384→1152, o 384→384, ffn1 384→1536, ffn2 1536→384) and a
+process-wide singleton backend — so minilm + bge + e5 all run on the NPU using
+only 4 contexts (the amdxdna driver limit). Layer count + pooling are inferred
+from each model's weights. Arbitrary HuggingFace ids also work on CPU.
+
 ## Backends (`-b`)
 
 | backend | runs on       | scope                                    |
@@ -70,6 +87,33 @@ free the CPU or run on battery, even if wall-clock is slower.
 > `pyxrt`, Python loads the slow system torch and everything crawls. The engine
 > avoids this by importing the venv torch *first*, then appending the system
 > path for `pyxrt`. **Do not set `PYTHONPATH=/usr/lib/python3.14/site-packages`.**
+
+## Hardened server (`xdna-embed server`)
+
+OpenAI-compatible, production-minded:
+
+- **Thread-safe + micro-batching**: each (model, backend) runs on a SINGLE
+  worker thread. HTTP handlers enqueue and block on a future. The worker
+  coalesces concurrent requests into one `embed()` call (up to `--max-batch`
+  texts within `--batch-window-ms`). A burst of single-query RAG lookups becomes
+  one batch-64 NPU forward instead of N padded ones.
+- **NPU serialisation**: a global lock guards all NPU inference (the device has
+  pooled BOs + runs one batch at a time), so multiple model workers sharing the
+  singleton backend can't race.
+- **Endpoints**: `POST /v1/embeddings` (with `dimensions`, `encoding_format`),
+  `GET /v1/models` (with NPU-availability flags), `GET /health?deep=1` (probe),
+  `GET /metrics`.
+- **Validation**: input count/length limits → proper OpenAI error codes.
+- **Graceful shutdown**: SIGTERM/SIGINT drain workers + close the socket.
+
+Micro-batch win (measured): 20 concurrent single-text requests coalesce into
+ONE batch — 230 ms total on NPU vs ~4.3 s unbatched (18× throughput for
+concurrent single-query load).
+
+```bash
+xdna-embed server -m minilm -b npu --port 8080 \
+  --max-batch 64 --batch-window-ms 5
+```
 
 ## Setup
 

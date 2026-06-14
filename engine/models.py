@@ -29,6 +29,7 @@ class ModelSpec:
     pooling: str            # "mean" | "last_token" | "cls"
     normalize: bool
     npu: str | None         # adapter name, or None if not NPU-supported
+    weights_dir: str | None = None   # local safetensors dir (else: HF cache)
 
 
 # Registry. `npu` is set only for models with compiled xclbins on THIS machine.
@@ -37,7 +38,7 @@ REGISTRY: dict[str, ModelSpec] = {
         alias="minilm",
         hf_id="sentence-transformers/all-MiniLM-L6-v2",
         dim=384, max_seq=64, pooling="mean", normalize=True,
-        npu="minilm",
+        npu="bert384", weights_dir="/tmp/voe-inspect/minilm",
     ),
     "qwen3-0.6b": ModelSpec(
         alias="qwen3-0.6b",
@@ -45,14 +46,16 @@ REGISTRY: dict[str, ModelSpec] = {
         dim=1024, max_seq=64, pooling="last_token", normalize=True,
         npu="qwen",
     ),
-    # CPU-only entries (no compiled NPU kernels yet; listed for convenience):
+    # BERT-384 family: share MiniLM's compiled bf16 GEMM kernels (same shapes).
     "bge-small": ModelSpec(
         alias="bge-small", hf_id="BAAI/bge-small-en-v1.5",
-        dim=384, max_seq=512, pooling="cls", normalize=True, npu=None,
+        dim=384, max_seq=64, pooling="cls", normalize=True,
+        npu="bert384", weights_dir="/tmp/voe-inspect/bge-small",
     ),
     "e5-small": ModelSpec(
         alias="e5-small", hf_id="intfloat/e5-small-v2",
-        dim=384, max_seq=512, pooling="mean", normalize=True, npu=None,
+        dim=384, max_seq=64, pooling="mean", normalize=True,
+        npu="bert384", weights_dir="/tmp/voe-inspect/e5-small",
     ),
 }
 

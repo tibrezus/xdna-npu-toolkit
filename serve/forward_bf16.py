@@ -16,6 +16,8 @@ import torch
 from ml_dtypes import bfloat16
 from safetensors import safe_open
 
+# Defaults for all-MiniLM-L6-v2. build_bf16_model() now infers the real values
+# from the weights (so any 384-dim BERT — BGE-small, E5-small — works too).
 N_LAYERS, HIDDEN, N_HEADS, HEAD_DIM, FFN = 6, 384, 12, 32, 1536
 EPS = 1e-12
 
@@ -67,13 +69,36 @@ class Bf16QKV:
         return t[..., :384], t[..., 384:768], t[..., 768:]
 
 
-def build_bf16_model(weights_dir, backend):
+def _infer_n_layers(keys):
+    """Count encoder layers from safetensors keys (robust to depth)."""
+    idx = []
+    for k in keys:
+        if k.startswith("encoder.layer."):
+            idx.append(int(k.split(".")[2]))
+    return max(idx) + 1 if idx else N_LAYERS
+
+
+def build_bf16_model(weights_dir, backend, pooling="mean"):
+    """Build a bf16 BERT model from a safetensors checkpoint.
+
+    Generic over any 384-dim BERT (MiniLM / BGE-small / E5-small — they share
+    the same GEMM shapes, so one set of compiled xclbins serves all). Layer
+    count is inferred from the weights; pooling is configurable.
+    """
     W = {}
     with safe_open(f"{weights_dir}/model.safetensors", framework="numpy") as f:
         for k in f.keys():
             W[k] = f.get_tensor(k)
+    n_layers = _infer_n_layers(W.keys())
+    hidden = W["embeddings.word_embeddings.weight"].shape[1]
+    # head_dim is hidden//n_heads for these BERTs; n_heads read from any q_proj
+    n_heads = 12 if hidden == 384 else (hidden // 64)
+    head_dim = hidden // n_heads
+    cfg = dict(n_layers=n_layers, hidden=hidden, n_heads=n_heads,
+               head_dim=head_dim, pooling=pooling)
     def L(n): return Bf16Linear(W[f"{n}.weight"], W[f"{n}.bias"], backend)
     return {
+        "_cfg": cfg,
         "word_emb": torch.from_numpy(W["embeddings.word_embeddings.weight"].astype(np.float32)).bfloat16(),
         "pos_emb": torch.from_numpy(W["embeddings.position_embeddings.weight"].astype(np.float32)).bfloat16(),
         "tok_emb": torch.from_numpy(W["embeddings.token_type_embeddings.weight"].astype(np.float32)).bfloat16(),
@@ -92,29 +117,39 @@ def build_bf16_model(weights_dir, backend):
             "f2": L(f"encoder.layer.{i}.output.dense"),
             "oln_w": torch.from_numpy(W[f"encoder.layer.{i}.output.LayerNorm.weight"].astype(np.float32)).bfloat16(),
             "oln_b": torch.from_numpy(W[f"encoder.layer.{i}.output.LayerNorm.bias"].astype(np.float32)).bfloat16(),
-        } for i in range(N_LAYERS)],
+        } for i in range(n_layers)],
     }
 
 
 def forward_bf16(model, ids, mask, backend):
+    cfg = model.get("_cfg", {})
+    n_layers = cfg.get("n_layers", N_LAYERS)
+    hidden = cfg.get("hidden", HIDDEN)
+    n_heads = cfg.get("n_heads", N_HEADS)
+    head_dim = cfg.get("head_dim", HEAD_DIM)
+    pooling = cfg.get("pooling", "mean")
     B, S = ids.shape
     ids_t = torch.from_numpy(ids); mask_t = torch.from_numpy(mask)
     x = model["word_emb"][ids_t] + model["pos_emb"][torch.arange(S)[None]] \
         + model["tok_emb"][torch.zeros_like(ids_t)]
     x = _ln(x, model["emb_ln_w"], model["emb_ln_b"])
     ext = mask_t[:, None, None, :].to(torch.bfloat16)
-    sqrt_hd = float(np.sqrt(HEAD_DIM))
+    sqrt_hd = float(np.sqrt(head_dim))
+    assert len(model["layers"]) == n_layers, (len(model["layers"]), n_layers)
     for ly in model["layers"]:
         q, k, v = ly["qkv"](x)                                     # ONE fused GEMM
-        def sp(t): return t.reshape(B, S, N_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+        def sp(t): return t.reshape(B, S, n_heads, head_dim).permute(0, 2, 1, 3)
         q, k, v = sp(q), sp(k), sp(v)
         scores = (q @ k.transpose(-2, -1)) / sqrt_hd + (1.0 - ext) * -1e4   # bf16: -1e9 clamps
         attn = torch.softmax(scores.float(), -1).to(torch.bfloat16)
-        ctx = (attn @ v).permute(0, 2, 1, 3).reshape(B, S, HIDDEN)
+        ctx = (attn @ v).permute(0, 2, 1, 3).reshape(B, S, hidden)
         ctx = ly["o"](ctx)
         x = _ln(x + ctx, ly["aln_w"], ly["aln_b"])
         h = ly["f2"](torch.nn.functional.gelu(ly["f1"](x)))
         x = _ln(x + h, ly["oln_w"], ly["oln_b"])
-    m = mask_t[:, :, None].to(torch.bfloat16)
-    pooled = (x * m).sum(1) / m.sum(1).clamp(min=1e-9)
+    if pooling == "cls":
+        pooled = x[:, 0]
+    else:  # mean
+        m = mask_t[:, :, None].to(torch.bfloat16)
+        pooled = (x * m).sum(1) / m.sum(1).clamp(min=1e-9)
     return torch.nn.functional.normalize(pooled.float(), dim=1).numpy()

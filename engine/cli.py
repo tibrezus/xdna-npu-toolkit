@@ -125,13 +125,14 @@ def _emit(args, texts, vecs):
 def cmd_server(args):
     from .server import serve
     banner(args.model, args.backend)
-    # validate model resolves (don't preload; server loads lazily per request)
     spec, _ = resolve(args.model)
     if args.backend == "npu" and spec.npu is None:
         sys.stderr.write(
             f"warn: default model '{args.model}' has no NPU kernels; "
             f"requests for it will use cpu unless the body sets a compiled alias.\n")
-    serve(args.host, args.port, args.model, args.backend)
+    serve(args.host, args.port, args.model, args.backend,
+          max_batch=args.max_batch, window_ms=args.batch_window_ms,
+          max_items=args.max_input_items, max_chars=args.max_text_chars)
 
 
 def _bench_one_subprocess(model: str, backend: str, sizes_csv: str) -> list[str]:
@@ -281,6 +282,12 @@ def build_parser():
     ps.add_argument("-b", "--backend", default="auto", choices=["npu", "cpu", "auto"])
     ps.add_argument("--host", default="127.0.0.1")
     ps.add_argument("--port", type=int, default=8080)
+    ps.add_argument("--max-batch", type=int, default=64,
+                    help="max texts coalesced into one embed() call (default 64 = one NPU forward)")
+    ps.add_argument("--batch-window-ms", type=float, default=5.0,
+                    help="coalesce window in ms (0 disables batching; calls still serialised)")
+    ps.add_argument("--max-input-items", type=int, default=4096)
+    ps.add_argument("--max-text-chars", type=int, default=32768)
     ps.set_defaults(func=cmd_server)
 
     # bench

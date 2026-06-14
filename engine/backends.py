@@ -42,6 +42,18 @@ for _sp in (_os.environ.get("XDNA_SYSTEM_SITE"), f"/usr/lib/python{_PY}/site-pac
 
 from .models import ModelSpec
 
+# Process-wide singleton NPU bf16 GEMM backend shared across all bert384 models
+# (they use identical GEMM shapes, so identical kernels/contexts). Keeps the
+# amdxdna 4-hw_context budget satisfied while letting minilm+bge+e5 coexist.
+_BF16_SINGLETON = None
+
+# The NPU is a single serial resource: pooled device BOs + at most one in-flight
+# batch. When multiple models share the singleton backend (or qwen uses its own),
+# concurrent worker threads would race on the device. This lock serialises ALL
+# NPU inference regardless of how many backends/workers exist.
+import threading as _threading
+_NPU_LOCK = _threading.Lock()
+
 # NPU forward code lives in the repo's serve/ dir; add it to the path.
 _SERVE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "serve")
 if _SERVE not in sys.path:
@@ -149,7 +161,7 @@ class NpuBackend:
         if spec.npu not in _NPU_ADAPTERS:
             raise RuntimeError(f"NPU adapter '{spec.npu}' not implemented.")
         self.spec = spec
-        self._adapter = _NPU_ADAPTERS[spec.npu]()
+        self._adapter = _NPU_ADAPTERS[spec.npu](spec)
         self._ready = False
 
     @property
@@ -164,40 +176,70 @@ class NpuBackend:
 
     def embed(self, texts: list[str]) -> np.ndarray:
         self._adapter.load(); self._ready = True
-        return self._adapter.embed(self.spec, texts)
+        # Serialise ALL NPU inference: the device has pooled BOs and can run one
+        # batch at a time. Multiple model workers share the singleton backend.
+        with _NPU_LOCK:
+            return self._adapter.embed(self.spec, texts)
 
 
 # ─── NPU adapters (one per compiled model family) ────────────────────────────
 
 class _NpuAdapter(Protocol):
+    def __init__(self, spec: ModelSpec) -> None: ...
     def load(self) -> None: ...
     def embed(self, spec: ModelSpec, texts: list[str]) -> np.ndarray: ...
 
 
-class _MinilmAdapter:
-    """MiniLM-L6-v2 on NPU: bf16 forward with fused qkv/ffn GEMMs (mean pool)."""
+class _Bert384Adapter:
+    """Any 384-dim BERT sentence model on NPU (MiniLM / BGE-small / E5-small).
+
+    These all share the SAME bf16 GEMM shapes (qkv 384->1152, o 384->384,
+    ffn1 384->1536, ffn2 1536->384), so one set of compiled xclbins serves
+    the whole family. Layer count + pooling come from the ModelSpec / weights.
+    The Bf16Backend is a process-wide SINGLETON, so minilm + bge + e5 can all be
+    resident at once using only 4 NPU contexts (the amdxdna driver limit).
+    """
     BATCH = 64  # compiled M=4096 = batch64 x seq64
 
-    def __init__(self):
-        self._model = self._npu = self._tok = None
+    def __init__(self, spec):
+        self._spec = spec
+        self._model = self._tok = None
+
+    @staticmethod
+    def _shared_backend():
+        """Process-wide singleton Bf16Backend (shared kernels/contexts)."""
+        global _BF16_SINGLETON
+        if _BF16_SINGLETON is None:
+            from bf16_backend import Bf16Backend
+            _BF16_SINGLETON = Bf16Backend()
+        return _BF16_SINGLETON
+
+    def _resolve_weights(self, spec):
+        """spec.weights_dir -> env XDNA_WEIGHTS_<ALIAS> -> HF cache download."""
+        env_key = "XDNA_WEIGHTS_" + spec.alias.upper().replace("-", "_")
+        for cand in (spec.weights_dir, os.environ.get(env_key)):
+            if cand and os.path.exists(os.path.join(cand, "model.safetensors")):
+                return cand
+        # fall back to HF cache (download if needed)
+        from huggingface_hub import snapshot_download
+        p = snapshot_download(repo_id=spec.hf_id, allow_patterns=[
+            "config.json", "model.safetensors", "tokenizer.json",
+            "tokenizer_config.json", "vocab.txt"])
+        return p
 
     def load(self):
         if self._model is not None:
             return
-        from bf16_backend import Bf16Backend
         from forward_bf16 import build_bf16_model
         from transformers import AutoTokenizer
-        wdir = os.environ.get("MINILM_WEIGHTS", "/tmp/voe-inspect/minilm")
-        if not os.path.exists(os.path.join(wdir, "model.safetensors")):
-            raise RuntimeError(
-                f"MiniLM weights not found at {wdir}/model.safetensors. "
-                f"Set MINILM_WEIGHTS=<dir> or download the model.")
-        self._tok = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-        self._npu = Bf16Backend()
-        self._model = build_bf16_model(wdir, self._npu.run)
+        wdir = self._resolve_weights(self._spec)
+        self._tok = AutoTokenizer.from_pretrained(self._spec.hf_id)
+        self._model = build_bf16_model(
+            wdir, self._shared_backend().run, pooling=self._spec.pooling)
 
     def embed(self, spec, texts):
         from forward_bf16 import forward_bf16
+        self.load()
         out = np.zeros((len(texts), spec.dim), np.float32)
         i = 0
         while i < len(texts):
@@ -208,7 +250,7 @@ class _MinilmAdapter:
                             max_length=spec.max_seq, return_tensors="np")
             ids = enc["input_ids"].astype(np.int64)
             mask = enc["attention_mask"].astype(np.int64)
-            emb = forward_bf16(self._model, ids, mask, self._npu.run)
+            emb = forward_bf16(self._model, ids, mask, self._shared_backend().run)
             got = min(self.BATCH, len(texts) - i)
             out[i:i + got] = emb[:got]
             i += got
@@ -219,7 +261,8 @@ class _QwenAdapter:
     """Qwen3-Embedding-0.6B on NPU: decoder forward (RMSNorm/GQA/SwiGLU, last-token pool)."""
     BATCH = 64  # compiled M=4096
 
-    def __init__(self):
+    def __init__(self, spec):
+        self._spec = spec
         self._model = self._weights = self._npu = self._spath = self._tok = None
 
     def _find_safetensors(self):
@@ -269,7 +312,7 @@ class _QwenAdapter:
 
 
 _NPU_ADAPTERS: dict[str, type[_NpuAdapter]] = {
-    "minilm": _MinilmAdapter,
+    "bert384": _Bert384Adapter,
     "qwen": _QwenAdapter,
 }
 
