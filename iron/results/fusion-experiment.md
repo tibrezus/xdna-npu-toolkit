@@ -64,3 +64,45 @@ The fusion direction is validated. The path to single-query NPU serving is:
 fuse the transformer block into one dispatch (GEMM → norm → activation → GEMM),
 keeping activations on-device throughout. The hard part is GEMM layout
 matching, not the round-trip tax.
+
+---
+
+## Appendix: the GEMM-to-GEMM fusion attempt (and why it's a different order of problem)
+
+I attempted to extend the fusion result to `C = (A@B)@D` with the intermediate
+on-device. It does NOT drop out of the elementwise proof. Two distinct obstacles:
+
+### 1. The dtype/requantization wall (the deeper one)
+AIE2 i16 MMUL is `i16 × i16 → i32` (accumulator wider than input). So GEMM1's
+output T is **i32**, but GEMM2's MMUL input must be **i16**. You cannot feed
+T directly into GEMM2 — you need a **requantization op** (rescale i32 → i16)
+on-device between the stages. That requant itself has to be fused, and its
+scale/zero-point must be computed per the quantization scheme. Real
+transformers do exactly this between every linear layer; it's not optional.
+
+This is the single biggest reason "fuse a transformer block by hand in IRON"
+is weeks of work, not hours: every GEMM→GEMM boundary needs a fused requant,
+and getting the numerics right (vs a float reference) is the hard part.
+
+### 2. Layout matching + runtime dataflow
+GEMM1 writes C in MMUL-tile order; GEMM2 expects its A-input in a (different)
+MMUL-tile order. Plus the runtime sequence must correctly: fill A,B tiles,
+loop over K (accumulation) in GEMM1, stream T tiles to GEMM2, loop over GEMM2's
+K (= GEMM1's N), fill D tiles, drain E tiles. Hand-authoring this correctly is
+the body of a small compiler.
+
+### Strategic implication
+These two obstacles are **precisely what AMD's VitisAI EP (Strategy B, #9)
+solves automatically** — it takes an ONNX, inserts the requants, matches
+layouts, and emits one fused dispatch. That is the value of the gated toolchain.
+Hand-rolling it in IRON (Strategy A) for one model = reinventing that compiler.
+
+### So what's the honest path to servable embeddings?
+- **Batched serving**: proven viable TODAY (34.7× over CPU), no fusion needed.
+- **Single-query via fusion**: mechanism proven (elementwise), but full-model
+  fusion is real compiler work. Two honest routes:
+  - (B) VitisAI EP — automatic, gated. Best leverage if the Linux gate lifts.
+  - (A-deep) Hand-build the fused transformer in IRON — feasible but weeks of
+    careful dataflow+requant work per model.
+- **Pragmatic single-query**: route to CPU/iGPU (Radeon 780M). Honest and correct
+  given the above.
