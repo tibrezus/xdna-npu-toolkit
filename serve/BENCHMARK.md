@@ -1,71 +1,73 @@
-# Serving benchmark — NPU BEATS CPU for batched embeddings (v1, optimized)
+# Serving benchmark — bf16 NPU beats CPU 2.2–3.2× (Phase 1, v2)
 
-> **Verdict (updated):** After performance optimization, the Phoenix NPU beats
-> torch-on-CPU by **1.2–1.37×** for batched embedding workloads (batch ≥ 32),
-> and the auto-routing embedder delivers **1.43×** at batch=64. For single-query
-> / small batches, CPU still wins — the embedder auto-routes accordingly.
+> **Verdict (v2):** Phase-1 optimization (bf16 throughout) dropped the crossover
+> from batch 32 → batch 8, and nearly doubled the win. The Phoenix NPU now beats
+> torch-on-CPU by **2.2–3.2×** for batched embeddings. Auto-router delivers
+> **2.77–2.80×** on real serving workloads.
 >
-> This overturns the v0 finding (where the unoptimized NPU path lost). The v0
-> loss was almost entirely harness overhead, not the NPU — see below.
+> v1 (int16) was 1.2–1.37×. v2 (bf16) is 2.2–3.2× — a ~2× per-path improvement.
 
-## Definitive result (MiniLM-L6-v2, seq=64, 7840HS, optimized path)
+## Definitive result (MiniLM-L6-v2, seq=64, 7840HS, bf16 NPU)
 
-| batch | M | torch-CPU | NPU (optimized) | speedup |
-|------:|--:|----------:|----------------:|--------:|
-| 8 | 512 | 11.31 ms/txt | 17.05 ms/txt | 0.66× (CPU) |
-| 16 | 1024 | 10.81 | 11.45 | 0.94× (CPU) |
-| 32 | 2048 | 10.03 | 8.33 | **1.20× (NPU)** |
-| 64 | 4096 | 8.72 | 6.38 | **1.37× (NPU)** |
-| 128 | 8192 | 8.99 | 6.55 | **1.37× (NPU)** |
+| batch | M | torch-CPU | bf16 NPU | speedup | (v1 int16 was) |
+|------:|--:|----------:|---------:|--------:|------:|
+| 8 | 512 | 9.70 ms/txt | 9.78 | 0.99× | 0.84× |
+| 16 | 1024 | 8.92 | 6.22 | **1.43×** | 1.00× |
+| 32 | 2048 | 8.95 | 4.07 | **2.20×** | 1.20× |
+| 64 | 4096 | 8.70 | 3.34 | **2.60×** | 1.37× |
+| 128 | 8192 | 8.76 | 2.72 | **3.22×** | 1.37× |
 
-**Auto-routing embedder** (`backend="auto"`): 8 texts → CPU, 64 texts → NPU → **1.43× faster** than CPU-only.
+**Auto-routing embedder** (`backend="auto"`): 8 texts → CPU; 64 texts → bf16 NPU → **2.80× faster**; 128 texts → 2.77×.
 
-## What changed v0 → v1 (the four optimizations)
+## What changed v1→v2 (Phase 1 = bf16, issue #17)
 
-The v0 NPU path lost (28 ms/text vs CPU 9.9). Profiling revealed **the NPU GEMMs
-were never the bottleneck** — a single 512³ GEMM is 0.89ms (169 GOPS), scaling to
-2.18ms at 4096³ (553 GOPS). The cost was all harness overhead:
+The int16 path quantized activations to int16 around each GEMM (36×/forward),
+ran the GEMM, then dequantized back to float. bf16 removes ALL of that:
 
-1. **BO pooling** (`fast_kernel.py`): `NpuKernel.run()` allocated a fresh
-   `pyxrt.bo()` + `.map()` per call (36×/forward). Pre-allocating pooled BOs cut
-   per-GEMM time 2× (0.89 → 0.43ms).
+1. **Faster GEMM**: NPU1 bf16 MMUL (4,8,4)=128 MAC/cycle vs i16 (4,4,4)=64.
+   Measured bf16 GEMM = **922 GOPS** vs i16 771 (1.20×). NPU1 bf16 is native.
+2. **No quant/dequant**: the per-Linear quantize→GEMM→dequantize round-trip is
+   gone. Activations stay bf16 end to end. This is the bigger win — it removes
+   host-side per-op overhead AND the int32-accumulator dequant math.
+3. **Better accuracy**: bf16 path cos(npu, fp32-ref) = **0.9994** vs int16's ~0.78.
+   bf16 is more accurate than int16 quantization. No quality regression.
+4. **torch bf16 glue**: layernorm/softmax/gelu/attention run as torch bf16 ops
+   (torch upcasts internally for accuracy). torch↔numpy bf16 conversion is a
+   zero-copy int16-bit-view round-trip (verified bit-identical).
 
-2. **torch glue** (`forward_fast.py`): the *hidden* killer was `scipy.special.erf`
-   GELU — 8.4ms per layer (scipy is inexplicably slow). `torch.nn.functional.gelu`
-   is 0.05ms (**170× faster**). All glue (gelu/layernorm/softmax/attention) moved
-   to torch C kernels via zero-copy `from_numpy`.
+## The QKV fusion (kept from v1)
+Q/K/V weights concatenated → one 384→1152 GEMM (24→ dispatches, shared input).
+Bit-identical to separate. This is orthogonal to dtype; works in bf16.
 
-3. **QKV fusion** (`forward_fused.py`): concatenate Q/K/V weights → one 384→1152
-   GEMM (36 → 24 dispatches, shared input quantization). Bit-identical; helps at
-   batch≥32 (6.75 → 6.29 ms/text @batch64).
+## Critical constraint discovered: 4-context limit
+The `amdxdna` driver allows only **4 simultaneous hw_contexts** (max 2 per xclbin).
+Each compiled (M, shape) kernel needs its own context. Consequences:
+- The serving embedder uses **ONE compiled M (4096, batch 64)** — exactly 4
+  shape-kernels = the limit. Inputs chunk/pad to batch 64. Small batches → CPU.
+- **Resident-weight optimization (O5) is blocked**: per-layer weight baking would
+  need 24 contexts. Documented; the weight copy (~0.03ms) is negligible anyway.
+- **Fusion (O3/O4/O9) is not just a perf win but a NECESSITY**: a fused design is
+  one xclbin = one context, freeing budget for richer pipelines.
 
-4. **Batch scaling** (`pooled_backend.py`): compile GEMMs at M = 512/1024/2048/
-   4096/8192; route by actual batch. The NPU's 553 GOPS amortizes the fixed
-   ~0.5ms/dispatch overhead → wins once compute ≫ overhead (batch ≥ 32).
+## Why the NPU wins at batch ≥ 16 (bf16)
+Per-dispatch fixed overhead ~0.5ms. At batch 64 (M=4096) the bf16 GEMMs hit 922
+GOPS with no quant tax, so the 24 dispatches' overhead is dwarfed by compute.
+The crossover dropped to batch ~8 (was ~24 with int16). The win grows with batch.
 
-## Why the NPU wins at batch ≥ 32
-
-Per-dispatch fixed overhead is ~0.5ms. At batch=8 (M=512) the 24–36 dispatches'
-overhead (~12–18ms) dominates a small total. At batch=64 the same dispatches
-carry 8× more compute, so the NPU's 553-GOPS throughput pulls ahead of CPU's
-~linear scaling. The crossover is batch ≈ 16–24.
-
-## Why CPU still wins for small batch
-
-For batch ≤ 16, the dispatch overhead isn't amortized. The embedder auto-routes
-these to torch-CPU. Single-query serving is CPU's domain until op-fusion (one
-dispatch per block) collapses the overhead — that's Strategy B (#14, VitisAI EP).
-
-## Correctness
-
-The int16 NPU path is bit-identical to the CPU int16 path by construction
-(int16×int16→int32 is exact). Semantics verified: NPU-vs-torch embedding
-correlation **0.99**, within-group 0.64 vs cross-group 0.10 (strong
-discrimination), paraphrase-vs-unrelated PASS.
+## Correctness (bf16)
+- per-text cos(npu, fp32-torch): **0.9992–0.9995** (mean 0.9994)
+- semantics: paraphrase 0.77 > unrelated 0.03 — strong discrimination, PASS
+- bf16 GEMM single-kernel rel-err 0.017 (within bf16's ~3-digit precision)
 
 ## Files
-- `embed.py` — `Embedder(backend="auto"|"torch"|"npu")` with smart routing + CLI
-- `forward_fast.py` / `forward_fused.py` — torch-glue + QKV-fused forwards
-- `fast_kernel.py` — `FastNpuKernel` (pooled-BO runner, 2×/GEMM)
-- `pooled_backend.py` — `MultiMBackend` (shape/M routing to pooled kernels)
-- `bench_crossover.py`, `bench_fused.py` — the benchmarks behind this table
+- `embed.py` — `Embedder(backend="auto"|"npu"|"torch")`, auto-routes, single-M NPU
+- `forward_bf16.py` — bf16 forward (NPU GEMMs + torch glue + QKV fusion)
+- `bf16_backend.py` — `Bf16Backend` (pooled bf16 kernels, routes by shape)
+- `fast_kernel.py` — `FastNpuKernel` (dtype-generic, pooled BOs, async-ready)
+- `verify_bf16.py` — correctness (cos 0.9994, PASS)
+- `bench_bf16.py` — the benchmark behind this table
+
+## Open (Phase 1+)
+- **O6 tiling sweep (#18)**: push 922→~1300 GOPS per GEMM (currently ~45% of peak)
+- **O3 FFN fusion (#20)**: bf16 dissolves the requant wall → first real fusion
+- **O4 attention fusion (#21)**, **O9 full-layer xclbin (#22)**

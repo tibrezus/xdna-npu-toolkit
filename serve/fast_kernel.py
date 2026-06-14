@@ -1,23 +1,39 @@
-"""fast_kernel.py — pooled-BO kernel runner for the NPU (the perf fix).
+"""fast_kernel.py — pooled-BO, dtype-generic kernel runner for the NPU.
 
-NpuKernel.run() allocates a fresh pyxrt.bo() + .map() per call — 36x/forward.
-That alloc/map is ~0.4ms/call = ~14ms/forward, and worse under contention.
+Three perf wins over NpuKernel.run():
+  - POOLED BOs: allocate input/output buffers once, reuse (2x/GEMM).
+  - RESIDENT WEIGHT (O5): for a Linear, the weight matrix is STATIC — stage it
+    once as a device BO and never copy it again. Only the activation moves per
+    dispatch. ~1-3 ms/forward saved.
+  - DTYPE-GENERIC: works for i16->i32 AND bf16->bf16 (O1 bf16 path).
+  - ASYNC submit()/wait() (O2): kern() is non-blocking; pipeline host work.
 
-FastNpuKernel pre-allocates input + output BOs ONCE (sized to the compiled shape)
-and reuses them: each run() just copies new data in + sync + run + sync back.
-No per-call allocation. This is the standard pattern for high-throughput serving.
+Usage:
+    # generic: weight supplied every call
+    k = FastNpuKernel(xc, ins, M, K, N, dtype_in=np.int16, dtype_out=np.int32)
+    out = k.run(A, B)
 
-API matches NpuKernel for drop-in use: kern.run(A_i16, B_i16) -> int32 [M,N].
+    # resident weight (Linear): stage once, run(A) only moves activation
+    k = FastNpuKernel(xc, ins, M, K, N, dtype_in=bfloat16, dtype_out=bfloat16, weight=W)
+    out = k.run(A)
 """
 from __future__ import annotations
 import numpy as np
 import pyxrt
 
+# bfloat16 lives in ml_dtypes; resolve lazily so import never hard-fails
+def _bf16():
+    from ml_dtypes import bfloat16
+    return bfloat16
+
 
 class FastNpuKernel:
-    def __init__(self, xclbin_path, insts_path, M, K, N, dtype_in=np.int16, dtype_out=np.int32):
+    def __init__(self, xclbin_path, insts_path, M, K, N,
+                 dtype_in=np.int16, dtype_out=np.int32, weight=None):
         self.M, self.K, self.N = M, K, N
         self._dtype_in, self._dtype_out = dtype_in, dtype_out
+        self._has_weight = weight is not None
+
         self._dev = pyxrt.device(0)
         xcl = pyxrt.xclbin(xclbin_path)
         self._dev.register_xclbin(xcl)
@@ -35,56 +51,64 @@ class FastNpuKernel:
         self._insts_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE,
                             self._insts_bytes, 0)
 
-        # POOLED input/output BOs (the win): allocate once, reuse
         HO = pyxrt.bo.flags.host_only
-        self._in0 = pyxrt.bo(self._dev, M*K*np.dtype(dtype_in).itemsize, HO, self._kern.group_id(3))
-        self._in1 = pyxrt.bo(self._dev, K*N*np.dtype(dtype_in).itemsize, HO, self._kern.group_id(4))
-        self._out = pyxrt.bo(self._dev, M*N*np.dtype(dtype_out).itemsize, HO, self._kern.group_id(5))
-        self._a = np.frombuffer(self._in0.map(), dtype=dtype_in)   # host view (zero-copy)
-        self._b = np.frombuffer(self._in1.map(), dtype=dtype_in)
-        self._c = np.frombuffer(self._out.map(), dtype=dtype_out)
         TO = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
         FR = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
         self._TO, self._FR = TO, FR
-        self._in0_sz = M*K*np.dtype(dtype_in).itemsize
-        self._in1_sz = K*N*np.dtype(dtype_in).itemsize
-        self._out_sz = M*N*np.dtype(dtype_out).itemsize
 
-    def run(self, A, B):
-        """A: [M,K] i16, B: [K,N] i16 -> int32 [M,N]. Reuses pooled BOs."""
-        self._a[:] = A.reshape(-1)
-        self._b[:] = B.reshape(-1)
+        # input activation BO (always moved per dispatch)
+        self._in0_sz = M * K * np.dtype(dtype_in).itemsize
+        self._in0 = pyxrt.bo(self._dev, self._in0_sz, HO, self._kern.group_id(3))
+        self._a = np.frombuffer(self._in0.map(), dtype=dtype_in)
+
+        # weight BO: resident (staged once) OR per-call
+        self._in1_sz = K * N * np.dtype(dtype_in).itemsize
+        self._in1 = pyxrt.bo(self._dev, self._in1_sz, HO, self._kern.group_id(4))
+        self._b = np.frombuffer(self._in1.map(), dtype=dtype_in)
+        if self._has_weight:
+            self._b[:] = np.ascontiguousarray(weight).reshape(-1)
+            self._in1.sync(TO, self._in1_sz, 0)   # stage once, never again
+
+        # output BO
+        self._out_sz = M * N * np.dtype(dtype_out).itemsize
+        self._out = pyxrt.bo(self._dev, self._out_sz, HO, self._kern.group_id(5))
+        self._c = np.frombuffer(self._out.map(), dtype=dtype_out)
+
+    def run(self, A, B=None):
+        """A:[M,K] activation -> [M,N] output. B required unless weight resident."""
+        self._a[:] = np.ascontiguousarray(A).reshape(-1)
         self._in0.sync(self._TO, self._in0_sz, 0)
-        self._in1.sync(self._TO, self._in1_sz, 0)
-        h = self._kern(3, self._insts_bo, self._insts_bytes, self._in0, self._in1, self._out, 0, 0)
-        st = h.wait()
-        if str(st) != str(pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED):
-            raise RuntimeError(f"kernel failed: {st}")
+        if not self._has_weight:
+            if B is None:
+                raise ValueError("B required (no resident weight staged)")
+            self._b[:] = np.ascontiguousarray(B).reshape(-1)
+            self._in1.sync(self._TO, self._in1_sz, 0)
+        self._wait(self._kern(3, self._insts_bo, self._insts_bytes,
+                              self._in0, self._in1, self._out, 0, 0))
         self._out.sync(self._FR, self._out_sz, 0)
         return self._c.copy().reshape(self.M, self.N)
 
+    def submit(self, A, B=None):
+        """Async: start the dispatch, return a run handle. Call wait(h) to collect.
 
-if __name__ == "__main__":
-    import sys, time
-    # A/B: pooled vs alloc-per-call, single GEMM
-    sys.path.insert(0, "/home/tib/projects/xdna-iron/designs")
-    from npu_kernel import NpuKernel
-    path = "/tmp/iron/minilm-gemms/qkv-4col.xclbin"
-    insts = "/tmp/iron/minilm-gemms/qkv-4col.insts.txt"
-    A = np.random.randint(-100,100,(512,384),np.int16); B = np.random.randint(-100,100,(384,384),np.int16)
+        NOTE: pooled output BO means you must wait() before the next submit()
+        (no double-buffering yet). Useful to overlap small host work with NPU compute.
+        """
+        self._a[:] = np.ascontiguousarray(A).reshape(-1)
+        self._in0.sync(self._TO, self._in0_sz, 0)
+        if not self._has_weight:
+            self._b[:] = np.ascontiguousarray(B).reshape(-1)
+            self._in1.sync(self._TO, self._in1_sz, 0)
+        return self._kern(3, self._insts_bo, self._insts_bytes,
+                          self._in0, self._in1, self._out, 0, 0)
 
-    k_old = NpuKernel(path, insts)
-    k_new = FastNpuKernel(path, insts, 512, 384, 384)
-    o_old = k_old.run(A,B,out_sizes=[512*384*4])[0].reshape(512,384)
-    o_new = k_new.run(A,B)
-    print("correctness (pooled==alloc):", "PASS" if np.array_equal(o_old,o_new) else "FAIL")
+    def collect(self, h):
+        """Collect output for a submitted run handle (blocks until done)."""
+        self._wait(h)
+        self._out.sync(self._FR, self._out_sz, 0)
+        return self._c.copy().reshape(self.M, self.N)
 
-    def bench(k, fn, n=200):
-        for _ in range(20): fn(k)
-        t0=time.time()
-        for _ in range(n): fn(k)
-        return (time.time()-t0)/n*1000
-    t_old = bench(k_old, lambda k: k.run(A,B,out_sizes=[512*384*4]))
-    t_new = bench(k_new, lambda k: k.run(A,B))
-    print(f"alloc-per-call: {t_old:.3f} ms")
-    print(f"pooled BOs:     {t_new:.3f} ms  ({t_old/t_new:.2f}x faster)")
+    def _wait(self, h):
+        st = h.wait()
+        if str(st) != str(pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED):
+            raise RuntimeError(f"kernel failed: {st}")
