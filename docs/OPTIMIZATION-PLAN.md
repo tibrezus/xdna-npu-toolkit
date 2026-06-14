@@ -91,12 +91,15 @@ Each ranked by **expected impact × feasibility / effort** on NPU1.
 
 ## 3. The plan (phased, each phase independently shippable)
 
-### Phase 1 — "bf16 + async" (low risk, ~1.3× over current → ~1.8× over CPU)
-1. **O1 bf16**: recompile 3 GEMMs × {4096, 8192} as bf16. Rewrite `FastLinear`/forward to stay bf16 (drop quant/dequant). Re-verify semantics (vs fp32 torch). *(~1 day)* — **the main Phase-1 win (proven 1.2×/GEMM + removes quant/dequant)**
-2. **O6 tiling sweep (early)**: find best (m,k,n) for the 4×4 array — biggest single per-GEMM lever. *(~1 day)*
-3. **O5 weight pre-staging**: resident weight BOs. *(~½ day)*
-4. **O2 async dispatch**: `FastNpuKernel.submit()/.wait()`, small overlap. *(~½ day, low payoff)*
-5. **Re-benchmark** vs CPU across batch sweep. Expected: 1.37× → ~1.8–2.0×.
+### Phase 1 — "bf16 + tiling" ✅ DONE — actual 2.2–3.2× over CPU (est. was 1.8–2.0×)
+1. **O1 bf16** ✅: recompiled 4 GEMMs × 5 M values as bf16. `forward_bf16.py` keeps bf16 end to end. cos(npu,fp32)=0.9994. *(commit `0a97265`)*
+2. **O6 tiling sweep** ✅: m=128 k=64 n=32 wins (1072 vs 906 GOPS, 1.17×/GEMM). Default at M=4096. *(commit + HF)*
+3. **O5 resident weights** ❌ BLOCKED: amdxdna = 4 hw_contexts max (discovered). Wontfix.
+4. **O2 async** ⬇️ deprioritized: measured only 1.04× (little host work to overlap once compute is fast).
+
+**Actual result**: batch 16: 1.61× | 32: 2.28× | 64: 2.72× | 128: 3.13× over torch-CPU. Crossover batch 8 (was 32). Beat the estimate (1.8–2.0×).
+
+**Key discovery**: amdxdna driver limits to **4 simultaneous hw_contexts** (2 per xclbin). The serving embedder uses ONE compiled M (4096=batch64 = exactly 4 shape-kernels). This makes **fusion a necessity** (one xclbin = one context frees budget), not just a perf win.
 
 ### Phase 2 — "first real fusion" (FFN block on-device)
 5. **O3 FFN fusion**: IRON design chaining FFN1(bf16) → gelu(AIE kernel) → FFN2(bf16) via self-loop fifos. Verify bit-exact vs the unfused bf16 path. *(~3–5 days, mobilenet `build_fused_pair` as blueprint)*
@@ -122,7 +125,7 @@ Each ranked by **expected impact × feasibility / effort** on NPU1.
 | phase | dispatches/fwd | est. vs CPU @batch64 | est. vs CPU @batch1 |
 |---|---|---|---|
 | now (baseline) | 24 | 1.37× | 0.66× (CPU wins) |
-| Phase 1 (bf16+tiling+async) | 24 | ~1.8–2.0× | ~1.0× (break-even) |
+| **Phase 1 ✅ DONE** | 24 | **2.72× (actual)** | ~1.0× (break-even) |
 | Phase 2 (+FFN fusion) | ~18 | ~2.3–2.8× | ~1.2× |
 | Phase 3 (+attn+tiling) | ~8 | ~3.5–4× | ~1.5× |
 | Phase 4 (full-layer) | ~6 | ~4×+ | ~2× (NPU wins single-query) |
