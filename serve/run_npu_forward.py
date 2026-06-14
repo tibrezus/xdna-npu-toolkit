@@ -26,8 +26,12 @@ texts = [
     "A man eats a meal at the table.",
     "The young girl is petting a small cat.",
     "Two dogs run together across the grassy park.",
+    "Someone is preparing a fresh salad in the kitchen.",
+    "A chef cooks a delicious dinner for guests.",
+    "The cat sleeps peacefully on the warm sofa.",
+    "A dog chases a ball across the open field.",
 ]
-B, S = 4, 64
+B, S = 8, 64   # M = 512 = compiled 4-col shape
 enc = tok(texts, padding="max_length", truncation=True, max_length=S, return_tensors="np")
 ids = enc["input_ids"].astype(np.int64)
 mask = enc["attention_mask"].astype(np.int64)

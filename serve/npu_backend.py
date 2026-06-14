@@ -14,8 +14,9 @@ from __future__ import annotations
 import os
 import numpy as np
 
-# locate the compiled gemms (staged at /tmp/iron/minilm-gemms/ during dev)
+# locate the compiled gemms (4-col, M=512 = batch8 x seq64) 
 GEMM_DIR = os.environ.get("MINILM_GEMM_DIR", "/tmp/iron/minilm-gemms")
+COMPILED_M = 512   # 4-col whole-array needs M >= 2*(m*n_rows)=512
 
 
 class NpuGemmPool:
@@ -28,12 +29,13 @@ class NpuGemmPool:
         key = (K, N)
         if key in cls._kernels:
             return cls._kernels[key]
-        # map (K,N) to the compiled design name
+        # map (K,N) to the compiled design name (4-col preferred)
         name = {(384, 384): "qkv", (384, 1536): "ffn1", (1536, 384): "ffn2"}.get(key)
+        suffix = "-4col"   # 4-col whole-array build (264-GOPS class)
         if name is None:
             raise KeyError(f"no compiled NPU GEMM for shape K={K} N={N}")
         from npu_kernel import NpuKernel   # imported at call time (needs NPU env)
-        k = NpuKernel(f"{GEMM_DIR}/{name}.xclbin", f"{GEMM_DIR}/{name}.insts.txt")
+        k = NpuKernel(f"{GEMM_DIR}/{name}{suffix}.xclbin", f"{GEMM_DIR}/{name}{suffix}.insts.txt")
         cls._kernels[key] = (k, key)
         return cls._kernels[key]
 
@@ -42,6 +44,6 @@ class NpuGemmPool:
         """xq: [M,K] int16, Wt: [K,N] int16 -> [M,N] int32, on the NPU."""
         kern, (K, N) = cls._load(xq.shape[1], Wt.shape[1])
         M = xq.shape[0]
-        assert M == 256, f"NPU GEMM compiled for M=256 (batch4 x seq64); got M={M}. Pad/batch."
+        assert M == COMPILED_M, f"4-col GEMM compiled for M={COMPILED_M} (batch8 x seq64); got M={M}."
         out = kern.run(xq, Wt, out_sizes=[M * N * 4], out_dtype=np.int32)[0].reshape(M, N)
         return out.astype(np.int32)

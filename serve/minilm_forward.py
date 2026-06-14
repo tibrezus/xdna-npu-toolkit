@@ -28,9 +28,10 @@ EPS = 1e-12
 
 
 def gelu(x):
-    # BERT uses the erf approximation
-    from math import sqrt
-    return 0.5 * x * (1.0 + np.vectorize(_erf)(x / sqrt(2.0)))
+    # BERT uses the exact erf gelu. scipy.special.erf is a fast vectorized C impl
+    # (np.vectorize was the slow path — 30x slower, unsuitable for serving).
+    from scipy.special import erf
+    return 0.5 * x * (1.0 + erf(x / np.sqrt(2.0)))
 
 
 def _erf(x):
