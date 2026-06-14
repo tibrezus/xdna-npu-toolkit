@@ -21,14 +21,28 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: System :: Hardware",
 ]
-dependencies = []  # stdlib only
+dependencies = []  # stdlib only (xdna-npu diagnostics)
+
+[project.optional-dependencies]
+# Embedding engine (xdna-embed): model forward + tokenization + NPU kernels.
+serve = [
+    "numpy",
+    "torch",
+    "transformers",
+    "safetensors",
+    "tokenizers",
+    "ml_dtypes",   # bfloat16 numpy dtype
+]
+# NPU execution additionally needs: pyxrt (Arch 'xrt' pkg, on PYTHONPATH) and
+# mlir-aie (IRON) wheels for the compiled-GEMM runtime. See docs/SETUP.md.
 
 [project.scripts]
 xdna-npu = "xdna_npu.cli:main"
+xdna-embed = "engine.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/tibrezus/xdna-npu-toolkit"
 Issues = "https://github.com/tibrezus/xdna-npu-toolkit/issues"
 
 [tool.setuptools]
-packages = ["xdna_npu"]
+packages = ["xdna_npu", "engine", "serve"]
