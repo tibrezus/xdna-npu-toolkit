@@ -1,58 +1,71 @@
-# Serving benchmark — the honest verdict (MiniLM-L6-v2 on 7840HS)
+# Serving benchmark — NPU BEATS CPU for batched embeddings (v1, optimized)
 
-The decisive test: does the Phoenix NPU actually beat CPU for serving MiniLM-L6-v2?
+> **Verdict (updated):** After performance optimization, the Phoenix NPU beats
+> torch-on-CPU by **1.2–1.37×** for batched embedding workloads (batch ≥ 32),
+> and the auto-routing embedder delivers **1.43×** at batch=64. For single-query
+> / small batches, CPU still wins — the embedder auto-routes accordingly.
+>
+> This overturns the v0 finding (where the unoptimized NPU path lost). The v0
+> loss was almost entirely harness overhead, not the NPU — see below.
 
-## Result (seq=64, i16 NPU path, float CPU paths)
+## Definitive result (MiniLM-L6-v2, seq=64, 7840HS, optimized path)
 
-| batch | torch-CPU | numpy-float | NPU-4col hybrid |
-|---|---|---|---|
-| 8 | **79 ms (9.9/text)** | 153 ms (19.1) | 226 ms (28.2) |
-| 16 | 145 ms (9.1) | 286 ms (17.8) | — |
-| 32 | 285 ms (8.9) | 554 ms (17.3) | — |
-| 64 | 611 ms (9.5) | 1115 ms (17.4) | — |
+| batch | M | torch-CPU | NPU (optimized) | speedup |
+|------:|--:|----------:|----------------:|--------:|
+| 8 | 512 | 11.31 ms/txt | 17.05 ms/txt | 0.66× (CPU) |
+| 16 | 1024 | 10.81 | 11.45 | 0.94× (CPU) |
+| 32 | 2048 | 10.03 | 8.33 | **1.20× (NPU)** |
+| 64 | 4096 | 8.72 | 6.38 | **1.37× (NPU)** |
+| 128 | 8192 | 8.99 | 6.55 | **1.37× (NPU)** |
 
-**torch-CPU is the fastest at every batch size.** The NPU-4col hybrid is slower
-than both torch-CPU and even our numpy-float reference.
+**Auto-routing embedder** (`backend="auto"`): 8 texts → CPU, 64 texts → NPU → **1.43× faster** than CPU-only.
 
-## Why (honest analysis)
+## What changed v0 → v1 (the four optimizations)
 
-Three compounding reasons the NPU loses for *this* model:
+The v0 NPU path lost (28 ms/text vs CPU 9.9). Profiling revealed **the NPU GEMMs
+were never the bottleneck** — a single 512³ GEMM is 0.89ms (169 GOPS), scaling to
+2.18ms at 4096³ (553 GOPS). The cost was all harness overhead:
 
-1. **The model is small.** MiniLM-L6-v2 is 22M params with 384/1536-dim GEMMs.
-   The NPU's 264-GOPS advantage needs *big* GEMMs to amortize; 384-dim GEMMs are
-   too small for the throughput to dominate.
-2. **24 separate dispatches (no fusion).** The hybrid design sends each of the
-   24 Linear GEMMs (Q/K/V/O ×6, FFN ×6×2) as a *separate* NPU dispatch. Each
-   dispatch pays a host↔NPU round trip (~5–10 ms). 24 × ~8 ms ≈ 190 ms of pure
-   dispatch overhead — that's most of the 226 ms. (This is exactly the
-   [fusion problem](../iron/results/fusion-experiment.md): without fusing the
-   block into one dispatch, per-op round trips dominate.)
-3. **torch CPU is extremely optimized.** AVX-512 + batched BLAS + fused ops.
-   Hard to beat for small models on a fast Zen 4 core.
+1. **BO pooling** (`fast_kernel.py`): `NpuKernel.run()` allocated a fresh
+   `pyxrt.bo()` + `.map()` per call (36×/forward). Pre-allocating pooled BOs cut
+   per-GEMM time 2× (0.89 → 0.43ms).
 
-## What this means for the goal
+2. **torch glue** (`forward_fast.py`): the *hidden* killer was `scipy.special.erf`
+   GELU — 8.4ms per layer (scipy is inexplicably slow). `torch.nn.functional.gelu`
+   is 0.05ms (**170× faster**). All glue (gelu/layernorm/softmax/attention) moved
+   to torch C kernels via zero-copy `from_numpy`.
 
-> **For MiniLM-L6-v2 specifically, the NPU is NOT a serving speedup over CPU.
-> The correct path is torch-on-CPU (or the Radeon 780M iGPU).**
+3. **QKV fusion** (`forward_fused.py`): concatenate Q/K/V weights → one 384→1152
+   GEMM (36 → 24 dispatches, shared input quantization). Bit-identical; helps at
+   batch≥32 (6.75 → 6.29 ms/text @batch64).
 
-The NPU's value proposition requires one of:
-- **A larger model** (768/1024/4096-dim GEMMs) where compute ≫ dispatch overhead.
-  Untested here — would need compiling those shapes. Likely the crossover point.
-- **Op fusion** (one dispatch for the whole block) — collapses the 24-dispatch
-  overhead. This is Strategy B's domain (VitisAI EP automatic fusion), or the
-  hard IRON-fusion work.
+4. **Batch scaling** (`pooled_backend.py`): compile GEMMs at M = 512/1024/2048/
+   4096/8192; route by actual batch. The NPU's 553 GOPS amortizes the fixed
+   ~0.5ms/dispatch overhead → wins once compute ≫ overhead (batch ≥ 32).
 
-## What IS proven (don't lose this)
+## Why the NPU wins at batch ≥ 32
 
-- The NPU executes MiniLM's GEMMs **bit-identically** to CPU (correctness, by
-  construction). The integration works.
-- The hybrid architecture (batch + route) is sound.
-- The 4-col GEMM at 512³ runs at 264 GOPS — that's real, just not enough headroom
-  to beat optimized CPU at MiniLM's tiny dims.
+Per-dispatch fixed overhead is ~0.5ms. At batch=8 (M=512) the 24–36 dispatches'
+overhead (~12–18ms) dominates a small total. At batch=64 the same dispatches
+carry 8× more compute, so the NPU's 553-GOPS throughput pulls ahead of CPU's
+~linear scaling. The crossover is batch ≈ 16–24.
 
-## Recommendation
+## Why CPU still wins for small batch
 
-For a *servable* MiniLM embedder today: **use torch-CPU** (9.9 ms/text). Route
-the NPU path to larger models or wait for fusion. This v0 ships the correct
-NPU execution + the honest benchmark so the decision is evidence-based, not
-wishful.
+For batch ≤ 16, the dispatch overhead isn't amortized. The embedder auto-routes
+these to torch-CPU. Single-query serving is CPU's domain until op-fusion (one
+dispatch per block) collapses the overhead — that's Strategy B (#14, VitisAI EP).
+
+## Correctness
+
+The int16 NPU path is bit-identical to the CPU int16 path by construction
+(int16×int16→int32 is exact). Semantics verified: NPU-vs-torch embedding
+correlation **0.99**, within-group 0.64 vs cross-group 0.10 (strong
+discrimination), paraphrase-vs-unrelated PASS.
+
+## Files
+- `embed.py` — `Embedder(backend="auto"|"torch"|"npu")` with smart routing + CLI
+- `forward_fast.py` / `forward_fused.py` — torch-glue + QKV-fused forwards
+- `fast_kernel.py` — `FastNpuKernel` (pooled-BO runner, 2×/GEMM)
+- `pooled_backend.py` — `MultiMBackend` (shape/M routing to pooled kernels)
+- `bench_crossover.py`, `bench_fused.py` — the benchmarks behind this table
