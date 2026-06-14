@@ -4,16 +4,20 @@
 > current 1.37× CPU win — derived from analyzing AMD's **production NPU2 stack**
 > (FastFlowLM, Ryzen AI SW) and the **open IRON fusion patterns** (mobilenet).
 
-## 0. Where we are (baseline, proven)
+## 0. Where we are (baseline, proven) — REVISED after profiling
+
+> **⚠ PROFILING UPDATE (2026-06-13):** Detailed profiling shows the bf16 forward is
+> **NPU-compute-bound**, not dispatch/overhead-bound. This overturns the fusion
+> estimates below. See `docs/PROFILING-FINDINGS.md`. Fusion's real prize is ~3-12%,
+> not 2-4×. Phase 1 (bf16) was the architectural win.
 
 | metric | value | how |
 |---|---|---|
-| Best speedup vs torch-CPU | **1.37×** @ batch 64/128 | pooled BOs + torch glue + QKV fusion |
-| Per-GEMM throughput (i16) | 553–771 GOPS | 4-col whole_array, M=4096 |
-| Per-GEMM throughput (bf16) | **922 GOPS** | same design, bf16 (measured) |
-| NPU1 theoretical peak (i16) | ~2048 GOPS | 16 tiles × 64 MAC/cycle × 1 GHz |
-| Current efficiency | **27–45%** of peak | headroom for per-GEMM wins |
-| Dispatches/forward | 24 (QKV-fused) | each ~0.43 ms pooled |
+| Best speedup vs torch-CPU | **2.72-3.13×** @ batch 64/128 | bf16 + tiling + pooled BOs (Phase 1) |
+| Per-GEMM throughput (bf16) | 976-1377 GOPS | 4-col whole_array, M=4096, bf16 |
+| NPU1 bf16 theoretical peak | ~4096 GOPS | 16 tiles × 128 MAC/cycle × 1 GHz × 2 |
+| Current efficiency | **34-55%** of bf16 peak | headroom in KERNEL efficiency, not architecture |
+| **Fusion prize (measured)** | **~3-5%** | transfer is 16GB/s; GEMM call is 99% compute |
 
 ## 1. What production NPU2 does (the reference architecture)
 
@@ -126,8 +130,14 @@ Each ranked by **expected impact × feasibility / effort** on NPU1.
 |---|---|---|---|
 | now (baseline) | 24 | 1.37× | 0.66× (CPU wins) |
 | **Phase 1 ✅ DONE** | 24 | **2.72× (actual)** | ~1.0× (break-even) |
-| Phase 2 (+FFN fusion) | ~18 | ~2.3–2.8× | ~1.2× |
-| Phase 3 (+attn+tiling) | ~8 | ~3.5–4× | ~1.5× |
-| Phase 4 (full-layer) | ~6 | ~4×+ | ~2× (NPU wins single-query) |
+| Phase 2 (+FFN fusion) | ~18 | **~3-5% more** *(revised down from 2.3-2.8×)* | ~1.05× |
+| Phase 3 (+attn+tiling) | ~8 | **~3% more** *(revised from 3.5-4×)* | ~1.1× |
+| Phase 4 (full-layer) | ~6 | **~10-12%** *(revised from 4×)* | ~1.2× |
 
-These are engineering estimates grounded in the measured per-GEMM numbers and dispatch counts, not guarantees. Each phase is independently measurable and shippable.
+**Why revised:** profiling (PROFILING-FINDINGS.md) shows the forward is
+compute-bound on the GEMMs (each call is 99% NPU compute, transfer ~0.15ms).
+Fusion keeps intermediates on-chip but does NOT reduce the GEMM compute. The
+original estimates assumed dispatch overhead dominated — true for v0 int16, false
+after bf16+pooling. **Fusion is now low-value; real lever is GEMM kernel throughput / larger models / Strategy B.**
+
+These are engineering estimates grounded in measured per-GEMM numbers and dispatch counts.
