@@ -18,6 +18,8 @@ import sys
 from . import __version__
 from .detect import detect
 from .embed import probe_ep, status_line as ep_status_line
+from .export_model import export_to_onnx
+from .runner import EmbedConfig, run_on_cpu, run_on_npu, status as runner_status
 from .enable import enable
 from .validate import validate_stack
 from .verdict import assess
@@ -176,6 +178,64 @@ def cmd_embed_setup(args: argparse.Namespace) -> int:
     return cmd_embed_check(args)
 
 
+def cmd_embed_status(args: argparse.Namespace) -> int:
+    _box("Embedding runner readiness")
+    st = runner_status()
+    ok = st["vitisai_stack_installed"]
+    sym = "✓" if ok else "✗"
+    col = GREEN if ok else YELLOW
+    print(_c(f"  {sym} AMD stack installed     : {ok}", col))
+    print(f"  Python 3.12               : {st['python3.12'] or '(not found)'}")
+    print(f"  dynamic-dispatch kernels  : {st['custom_op_lib'] or '(not installed)'}")
+    print(f"  {st['note']}")
+    return 0 if ok else 1
+
+
+def cmd_embed_export(args: argparse.Namespace) -> int:
+    _box("Export embedding model to ONNX")
+    from .runner import _cpu_python_with_transformers
+    py = args.python or _cpu_python_with_transformers()
+    out = args.out or os.path.join(".", args.model.split("/")[-1])
+    print(f"  model : {args.model}")
+    print(f"  out   : {out}")
+    print(f"  python: {py}")
+    try:
+        path = export_to_onnx(args.model, out, python=py)
+    except Exception as exc:  # noqa: BLE001
+        print(_c(f"  ✗ {exc}", RED))
+        return 1
+    print(_c(f"  ✓ exported -> {path}", GREEN))
+    print(f"  test: xdna-npu embed-run 'hello world' --cpu --model {path} --tokenizer {out}")
+    return 0
+
+
+def cmd_embed_run(args: argparse.Namespace) -> int:
+    _box("Embedding inference")
+    text = args.text
+    if args.cpu:
+        if not args.model:
+            print(_c("  ✗ --model <onnx> is required for CPU mode", RED))
+            return 2
+        r = run_on_cpu(text, args.model, tokenizer_dir=args.tokenizer, python=args.python)
+    else:
+        cfg = EmbedConfig(model_name=args.model or "", device=args.device or "phx")
+        if not args.model:
+            print(_c("  ✗ --model <name> is required for NPU mode (a compiled PHX embedding model)", RED))
+            print("     Place it under ~/.local/share/ryzen-ai-models/<name>/  (see wiki: Embed-Runner)")
+            return 2
+        r = run_on_npu(text, cfg, python=args.python)
+    if r.error:
+        print(_c(f"  ✗ error: {r.error}", RED))
+        return 1
+    print(f"  device : {r.device}")
+    print(f"  dim    : {r.dim}")
+    print(f"  time   : {r.ms:.2f} ms")
+    if r.embedding:
+        preview = ", ".join(f"{v:+.4f}" for v in r.embedding[:6])
+        print(f"  vector : [{preview}, ...] ({r.dim}-d)")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     dev = detect()
     v = assess(dev)
@@ -242,6 +302,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("embed-setup", help="install the AMD VitisAI stack for embeddings")
     sp.add_argument("--python", help="path to a Python 3.12 interpreter")
     sp.set_defaults(func=cmd_embed_setup)
+
+    sp = sub.add_parser("embed-status", help="embedding runner readiness (NPU stack + custom-op lib)")
+    sp.add_argument("--python", help="path to a Python 3.12 interpreter")
+    sp.set_defaults(func=cmd_embed_status)
+
+    sp = sub.add_parser("embed-export", help="export a HF embedding model to ONNX (for the CPU reference path)")
+    sp.add_argument("model", help="HuggingFace model id, e.g. sentence-transformers/all-MiniLM-L6-v2")
+    sp.add_argument("--out", help="output directory (default: ./<model-name>)")
+    sp.add_argument("--python", help="interpreter with torch+transformers (default: auto-detect)")
+    sp.set_defaults(func=cmd_embed_export)
+
+    sp = sub.add_parser("embed-run", help="run an embedding model (NPU compiled, or CPU reference)")
+    sp.add_argument("text", help="text to embed")
+    sp.add_argument("--model", help="NPU: model name under ~/.local/share/ryzen-ai-models/; CPU: path to .onnx")
+    sp.add_argument("--cpu", action="store_true", help="run on CPU with stock onnxruntime (reference backend)")
+    sp.add_argument("--tokenizer", help="tokenizer dir (CPU mode; defaults to model dir)")
+    sp.add_argument("--device", default="phx", help="NPU target: phx (XDNA1) or stx (XDNA2)")
+    sp.add_argument("--python", help="path to a Python 3.12 interpreter (NPU mode)")
+    sp.set_defaults(func=cmd_embed_run)
 
     sp = sub.add_parser("status", help="one-line machine-readable status")
     sp.set_defaults(func=cmd_status)
