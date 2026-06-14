@@ -1,8 +1,10 @@
 # Strategy A — Embeddings on Phoenix (NPU1) via IRON/Peano
 
-> **Status: PROVEN.** The transformer-core op (int16 GEMM) compiles AND executes
-> correctly on the Phoenix NPU, fully on Linux, fully open-source. See
-> [`results/gemm-256-benchmark.md`](results/gemm-256-benchmark.md) and
+> **Status: PROVEN + serving scaffolded.** int16 GEMM (1-col & 4-col) and the
+> batch=1 GEMV all compile and run correctly on the Phoenix NPU, fully on Linux,
+> fully open-source. A batched embedding server demonstrates the viable path:
+> **34.7× faster than CPU for batched embedding.** See
+> [`ARCHITECTURE.md`](ARCHITECTURE.md), [`results/`](results/), and
 > [issue #8](https://github.com/tibrezus/xdna-npu-toolkit/issues/8).
 
 The AMD Ryzen 7 7840HS has a Phoenix NPU (XDNA 1 / AIE-ML / AIE2). AMD's own
@@ -50,17 +52,19 @@ python3 ../../../../../../iron/designs/bench_gemm.py $(pwd)/build
 # NPU (1 core): 0.82 ms/op, 41.2 GOPS   |   CPU numpy: 13.70 ms/op, 2.4 GOPS   (16.8x)
 ```
 
-## Result
+## Results
 
-int16 GEMM 256×256×256 on Phoenix, single AIE core, verified exact vs numpy:
+| design | shape | cores | time/op | GOPS | vs CPU |
+|---|---|---|---|---|---|
+| single_core GEMM | 256³ | 1 | 1.10 ms | 30.5 | 16.8× faster |
+| **whole_array GEMM** | **512³** | **16 (4×4)** | **1.01 ms** | **264.7** | — |
+| matrix_vector (batch=1) | 288² | 1 | 0.376 ms | 0.4 | **8× slower** |
+| **batched server (512 batch)** | **512³** | **16** | **1.84 ms** | **146** | **34.7× faster** |
 
-| | time/op | GOPS |
-|---|---|---|
-| **NPU (1 core, Peano)** | **0.82 ms** | **41.2** |
-| CPU numpy (multi-thread) | 13.70 ms | 2.4 |
-| **NPU speedup** | **16.8×** | |
-
-Single-core design. A 4-column Phoenix design projects to ~0.2 ms (~160 GOPS).
+All verified EXACT vs numpy. The batch=1 finding (8× slower) is the key
+architectural constraint — see [`ARCHITECTURE.md`](ARCHITECTURE.md): the NPU
+wins for batched workloads and loses for single-query (host↔NPU round-trip
+bound) unless the model fuses into one dispatch.
 
 ## Two non-obvious technical facts
 
@@ -76,14 +80,29 @@ Single-core design. A 4-column Phoenix design projects to ~0.2 ms (~160 GOPS).
 2. **Phoenix (NPU1) = 4 compute columns × 4 compute rows = 16 tiles** in IRON
    (one column reserved from the firmware's 5). i16 MMUL geometry is (4,4,4).
 
-## Roadmap to a real embedding model (tracked in issue #8)
+## Run the serving demo (no compile needed)
 
-The GEMM proves compute. Remaining work is kernel composition — all have IRON
-examples — stitched into a transformer:
+The repo ships pre-compiled Phoenix xclbins in `builds/`:
 
-- [ ] 4-column GEMM (adapt `whole_array` NPU2→NPU1) — ~4× throughput
-- [ ] LayerNorm, Softmax, GELU, quantized-embedding-gather kernels
-- [ ] Compose one transformer layer (QKV → attention → FFN)
+```bash
+source setup-env.sh                       # needs the venv from bootstrap.sh
+python3 designs/npu_server.py             # batched server: route + 34.7x batched win
+python3 designs/bench_1col_vs_4col.py     # 1-col vs 4-col scaling (264 GOPS)
+python3 designs/run_gemm.py builds        # single-core GEMM verify
+python3 designs/run_gemv.py               # batch=1 GEMV (the round-trip demo)
+```
+
+## Roadmap to full-model serving (tracked in issue #8)
+
+The serving **pattern** is proven (batch + route). Remaining work to serve a
+*full* embedding model (MiniLM-L6-v2) rather than a linear layer:
+
+- [x] 4-column GEMM (264 GOPS) — **done**
+- [x] batch=1 GEMV + round-trip analysis — **done**
+- [x] batched serving scaffold (`npu_server.py`) — **done**
+- [ ] LayerNorm, Softmax, GELU kernels (compose into a transformer block)
+- [ ] Op fusion: keep a transformer block on-device for one round trip
+      (unblocks batch=1; this is the hard part — overlaps with Strategy B)
 - [ ] MiniLM-L6-v2 equivalent (6 layers, 384-dim, i16) → publish compiled xclbins
 
 ## Honest caveats
