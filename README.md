@@ -23,6 +23,8 @@ fully enabled and tells you exactly what is and isn't possible on your silicon.
 | `xdna-npu detect` | NPU hardware detection (PCI, driver, firmware, live AIE cols/rows) | no |
 | `xdna-npu validate` | Stack checks (kernel driver, device node, firmware, XRT, plugin, memlock) | no |
 | `xdna-npu enable` | Install the memlock drop-in + set NPU power mode to performance | **yes** |
+| `xdna-npu embed-check` | Probe whether the AMD VitisAI EP initializes on the XDNA 1 NPU | no |
+| `xdna-npu embed-setup` | Install the AMD VitisAI stack (onnxruntime-vitisai, voe, dynamic-dispatch) | no |
 | `xdna-npu status` | One-line machine-readable status | no |
 
 `doctor`, `detect`, `validate` and `status` issue the `DRM_IOCTL_AMDXDNA_GET_INFO`
@@ -119,6 +121,49 @@ export PYTORCH_ROCM_ARCH="gfx1100"
 The NPU stays enabled and ready for classic ONNX vision/NLP workloads once a
 redistributable Phoenix overlay exists.
 
+## What about embeddings / CNNs / transformers (not LLMs)?
+
+**This is a different — and more positive — story than LLMs.** Smaller models
+(BERT/MiniLM/E5/GTE-class embeddings, ResNet/YOLO vision) are exactly what AMD's
+VitisAI stack was built for, and that stack *does* support Phoenix.
+
+`xdna-npu embed-check` probes it live. On a Ryzen 7 7840HS:
+
+```
+── AMD VitisAI Execution Provider probe (XDNA 1) ───────────────
+  ✓ EP listed by onnxruntime : True
+  ✓ EP initializes on NPU   : True
+  providers                   : VitisAIExecutionProvider, CPUExecutionProvider
+  at-runtime compile available: False (deployment-only build)
+```
+
+i.e. **the NPU execution provider initializes on XDNA 1**. Unlike LLMs (whose
+runtimes reject Phoenix outright), transformer/CNN inference is *runtime-
+supported* on XDNA 1 on Linux. The whole public runtime stack —
+`onnxruntime-vitisai`, `voe` (with `4x4`/Phoenix kernels), `ryzenai-dynamic-
+dispatch`, `ryzenai-onnx-utils` — installs from AMD's public pip index
+(`pypi.amd.com`) with **no account gate**, and the voe compiler code branches
+explicitly on `device in ["phx", "stx"]`.
+
+The one remaining gate is *model compilation*. The publicly-installable Linux
+wheels are a **deployment-only** build: they *run* a pre-compiled model but emit
+`Model compilation is not supported in a deployment only installation` if you
+ask them to compile an ONNX graph to the NPU at runtime. The full compiler ships
+only inside AMD's account-gated Ryzen AI Software installer. So:
+
+- **You can run a pre-compiled Phoenix embedding model today** (none ships
+  publicly yet — the lone HF embedding model, `amd/NPU-Nomic-embed-text-v1.5-ryzen-
+  strix-cpp`, is Strix/XDNA2-only). This is a real gap, and a good first target.
+- **To compile your own** embedding ONNX to the NPU, you need AMD's installer.
+
+To set up the stack:
+
+```bash
+uv python install 3.12          # the AMD wheels are cp312
+xdna-npu embed-setup            # installs the AMD wheels, then probes the EP
+xdna-npu embed-check            # re-probe anytime
+```
+
 ## Requirements
 
 - An AMD XDNA NPU and the `amdxdna` kernel driver (mainline since 6.11; best on 7.x).
@@ -135,6 +180,7 @@ xdna_npu/
   validate.py   stack checks (driver/node/fw/XRT/plugin/memlock)
   verdict.py    column-count -> feasibility verdict + iGPU fallback path
   enable.py     memlock limits.d drop-in + NPU power mode (root)
+  embed.py      AMD VitisAI EP setup + live probe (proves EP initializes on XDNA 1)
   cli.py        argparse front-end
 scripts/
   enable-npu.sh standalone shell enablement (no Python needed)

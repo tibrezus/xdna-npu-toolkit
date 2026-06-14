@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 
 from . import __version__
 from .detect import detect
+from .embed import probe_ep, status_line as ep_status_line
 from .enable import enable
 from .validate import validate_stack
 from .verdict import assess
@@ -125,6 +127,55 @@ def cmd_enable(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_embed_check(args: argparse.Namespace) -> int:
+    _box("AMD VitisAI Execution Provider probe (XDNA 1)")
+    p = probe_ep(args.python)
+    sym = "✓" if p.session_initialized else "✗"
+    col = GREEN if p.session_initialized else RED
+    print(_c(f"  {sym} EP listed by onnxruntime : {p.vitisai_available}", col))
+    print(_c(f"  {sym} EP initializes on NPU   : {p.session_initialized}", col))
+    print(f"  providers                   : {', '.join(p.providers)}")
+    print(f"  at-runtime compile available: {p.compile_supported}"
+          + (" (deployment-only build)" if p.deployment_only else ""))
+    if not p.session_initialized:
+        print()
+        print(_c("  messages:", YELLOW))
+        for m in p.messages[-8:]:
+            for line in m.splitlines()[-6:]:
+                print(f"      {line}")
+        print()
+        print(_c("  → Install the stack: xdna-npu embed-setup (needs Python 3.12)", YELLOW))
+    return 0 if p.session_initialized else 1
+
+
+def cmd_embed_setup(args: argparse.Namespace) -> int:
+    _box("Setup AMD VitisAI stack for XDNA 1 embeddings")
+    import shutil
+    py = args.python
+    if not py:
+        from .embed import _find_python312
+        py = _find_python312()
+        if not py:
+            print(_c("  ✗ No CPython 3.12 found. Install one first:", RED))
+            print("      uv python install 3.12   # fastest")
+            print("      (then: xdna-npu embed-setup)")
+            return 1
+    print(f"  Using Python: {py}")
+    uv = shutil.which("uv")
+    pip = [uv, "pip", "install", "--python", py, "--extra-index-url",
+           "https://pypi.amd.com/ryzenai_llm/1.7.1/linux/simple/",
+           "--index-strategy", "unsafe-best-match"] if uv \
+        else [py, "-m", "pip", "install", "--extra-index-url",
+              "https://pypi.amd.com/ryzenai_llm/1.7.1/linux/simple/"]
+    print(f"  Installing: {', '.join(['numpy<2'] + __import__('xdna_npu.embed', fromlist=['AMD_PKGS']).AMD_PKGS)}")
+    rc = subprocess.call(pip + ["numpy<2"] + __import__('xdna_npu.embed', fromlist=['AMD_PKGS']).AMD_PKGS)
+    if rc != 0:
+        print(_c("  ✗ install failed", RED))
+        return rc
+    print(_c("  ✓ installed. Probing EP ...", GREEN))
+    return cmd_embed_check(args)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     dev = detect()
     v = assess(dev)
@@ -183,6 +234,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("enable", help="apply memlock + power-mode fixes (needs root)")
     sp.set_defaults(func=cmd_enable)
+
+    sp = sub.add_parser("embed-check", help="probe the AMD VitisAI EP on the XDNA 1 NPU")
+    sp.add_argument("--python", help="path to a Python 3.12 interpreter")
+    sp.set_defaults(func=cmd_embed_check)
+
+    sp = sub.add_parser("embed-setup", help="install the AMD VitisAI stack for embeddings")
+    sp.add_argument("--python", help="path to a Python 3.12 interpreter")
+    sp.set_defaults(func=cmd_embed_setup)
 
     sp = sub.add_parser("status", help="one-line machine-readable status")
     sp.set_defaults(func=cmd_status)
