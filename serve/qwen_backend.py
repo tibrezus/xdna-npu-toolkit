@@ -19,7 +19,10 @@ SHAPES = {
     (1024, 6144): "gate_up",
     (3072, 1024): "down",
 }
-ROOT = "/tmp/iron/qwen-gemms-bf16"
+# Compiled Qwen GEMM xclbins under XDNA_HOME/iron/gemms (relocate via XDNA_HOME
+# or XDNA_QWEN_ROOT). Default ~/source/NPU.
+_XDNA_HOME = os.path.expanduser(os.environ.get("XDNA_HOME", "~/source/NPU"))
+ROOT = os.environ.get("XDNA_QWEN_ROOT", os.path.join(_XDNA_HOME, "iron", "gemms", "qwen-gemms-bf16"))
 
 
 class QwenBf16Backend:

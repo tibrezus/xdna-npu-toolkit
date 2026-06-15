@@ -10,6 +10,11 @@ import numpy as np
 from ml_dtypes import bfloat16
 from fast_kernel import FastNpuKernel
 
+# Compiled bf16 GEMM xclbins live under XDNA_HOME/iron/gemms (set XDNA_HOME or
+# XDNA_GEMM_ROOT to relocate). Default ~/source/NPU.
+_XDNA_HOME = os.path.expanduser(os.environ.get("XDNA_HOME", "~/source/NPU"))
+_GEMM_ROOT = os.environ.get("XDNA_GEMM_ROOT", os.path.join(_XDNA_HOME, "iron", "gemms"))
+
 # (K, N) -> compiled design name
 SHAPES = {
     (384, 384): "qkv",
@@ -18,14 +23,8 @@ SHAPES = {
     (1536, 384): "ffn2",
 }
 
-# M -> directory of compiled bf16 xclbins
-ROOTS = {
-    512: "/tmp/iron/minilm-gemms-bf16-M512",
-    1024: "/tmp/iron/minilm-gemms-bf16-M1024",
-    2048: "/tmp/iron/minilm-gemms-bf16-M2048",
-    4096: "/tmp/iron/minilm-gemms-bf16-M4096",
-    8192: "/tmp/iron/minilm-gemms-bf16-M8192",
-}
+# M -> directory of compiled bf16 xclbins (one dir per compiled batch-geometry)
+ROOTS = {M: os.path.join(_GEMM_ROOT, f"minilm-gemms-bf16-M{M}") for M in (512, 1024, 2048, 4096, 8192)}
 
 
 class Bf16Backend:

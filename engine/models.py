@@ -17,7 +17,17 @@ one place the engine differs from llama.cpp: the NPU is not a universal JIT,
 it needs per-model-shape compiled kernels.
 """
 from __future__ import annotations
+import os
 from dataclasses import dataclass
+
+# Single source of truth for where compiled GEMMs + weights live. Override with
+# the XDNA_HOME env var; defaults to ~/source/NPU. All NPU paths derive from it.
+XDNA_HOME = os.path.expanduser(os.environ.get("XDNA_HOME", "~/source/NPU"))
+
+
+def _weights(alias: str) -> str:
+    """Local weights dir for a model alias under XDNA_HOME."""
+    return os.path.join(XDNA_HOME, "weights", alias)
 
 
 @dataclass(frozen=True)
@@ -38,7 +48,7 @@ REGISTRY: dict[str, ModelSpec] = {
         alias="minilm",
         hf_id="sentence-transformers/all-MiniLM-L6-v2",
         dim=384, max_seq=64, pooling="mean", normalize=True,
-        npu="bert384", weights_dir="/tmp/voe-inspect/minilm",
+        npu="bert384", weights_dir=_weights("minilm"),
     ),
     "qwen3-0.6b": ModelSpec(
         alias="qwen3-0.6b",
@@ -50,12 +60,12 @@ REGISTRY: dict[str, ModelSpec] = {
     "bge-small": ModelSpec(
         alias="bge-small", hf_id="BAAI/bge-small-en-v1.5",
         dim=384, max_seq=64, pooling="cls", normalize=True,
-        npu="bert384", weights_dir="/tmp/voe-inspect/bge-small",
+        npu="bert384", weights_dir=_weights("bge-small"),
     ),
     "e5-small": ModelSpec(
         alias="e5-small", hf_id="intfloat/e5-small-v2",
         dim=384, max_seq=64, pooling="mean", normalize=True,
-        npu="bert384", weights_dir="/tmp/voe-inspect/e5-small",
+        npu="bert384", weights_dir=_weights("e5-small"),
     ),
 }
 
