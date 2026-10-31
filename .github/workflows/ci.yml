@@ -25,5 +25,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest && pytest -q tests
-      - run: pip install . && xdna-npu --help > /dev/null
+      - run: pip install . pytest && python -m pytest -q tests && xdna-npu --help > /dev/null
