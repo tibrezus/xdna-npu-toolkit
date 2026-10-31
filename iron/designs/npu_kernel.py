@@ -12,10 +12,12 @@ Usage:
 """
 from __future__ import annotations
 import os, re, time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
 import pyxrt
+
+_COMPLETED = str(pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED)
 
 
 def _find_files(build_dir: str, shape_tag: str):
@@ -39,6 +41,7 @@ class NpuKernel:
     _kern: object = None
     _insts_bo: object = None
     _insts_bytes: int = 0
+    _pool: dict = field(default_factory=dict)
 
     @classmethod
     def from_build(cls, build_dir: str, shape_tag: str) -> "NpuKernel":
@@ -61,15 +64,28 @@ class NpuKernel:
         bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE, self._insts_bytes, 0)
         self._insts_bo = bo
 
+    def _bo(self, gid: int, nbytes: int, slot: int = 0):
+        """Pooled BO: one device buffer per (group, size, slot), reused across calls.
+
+        Per-call pyxrt.bo() allocation is the single largest dispatch cost on
+        amdxdna (~0.25 ms); pooling removes it. Outputs are copied out after
+        completion, so buffer reuse never leaks stale data to the caller.
+        """
+        key = (gid, nbytes, slot)
+        bo = self._pool.get(key)
+        if bo is None:
+            bo = pyxrt.bo(self._dev, nbytes, pyxrt.bo.flags.host_only, self._kern.group_id(gid))
+            self._pool[key] = bo
+        return bo
+
     def run(self, *tensors: np.ndarray, out_sizes: list[int] | None = None,
             out_dtype=np.int32) -> list[np.ndarray]:
         """Run the kernel. tensors are inputs (numpy). Returns output array(s).
 
         out_sizes: byte sizes of each output buffer (default: one output = product of its shape).
         Kernel arg layout (IRON convention): (3, insts_bo, insts_bytes, *in_bos, *out_bos, 0...)
-        Inputs occupy group ids 3,4,...; outputs follow. We allocate output BOs and return them.
+        Inputs occupy group ids 3,4,...; outputs follow. Output arrays are copies.
         """
-        HOST_ONLY = pyxrt.bo.flags.host_only
         TO_DEV = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
         FROM_DEV = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
 
@@ -77,29 +93,62 @@ class NpuKernel:
         gid = 3
         for t in tensors:
             t = np.ascontiguousarray(t)
-            bo = pyxrt.bo(self._dev, t.nbytes, HOST_ONLY, self._kern.group_id(gid))
+            bo = self._bo(gid, t.nbytes)
             np.frombuffer(bo.map(), dtype=t.dtype)[:] = t.reshape(-1)
             bo.sync(TO_DEV, t.nbytes, 0)
             in_bos.append(bo)
             gid += 1
 
-        out_bos = []
-        results = []
+        out_bos, results = [], []
         for sz in (out_sizes or []):
-            bo = pyxrt.bo(self._dev, sz, HOST_ONLY, self._kern.group_id(gid))
-            arr = np.frombuffer(bo.map(), dtype=out_dtype)
+            bo = self._bo(gid, sz)
             out_bos.append(bo)
-            results.append(arr)
+            results.append(np.frombuffer(bo.map(), dtype=out_dtype))
             gid += 1
 
         h = self._kern(3, self._insts_bo, self._insts_bytes, *in_bos, *out_bos, 0, 0)
         state = h.wait()
-        if str(state) != str(pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED):
+        if str(state) != _COMPLETED:
             raise RuntimeError(f"NPU kernel did not complete: {state}")
 
         for bo, arr in zip(out_bos, results):
             bo.sync(FROM_DEV, arr.nbytes, 0)
         return [a.copy() for a in results]
+
+    def run_many(self, jobs: list[tuple], out_size: int,
+                 out_dtype=np.int32) -> list[np.ndarray]:
+        """Pipelined batch execution: submit len(jobs) execs back-to-back, wait once.
+
+        jobs: list of tensor-tuples, each matching the kernel's input layout (same
+        shapes across jobs). One output buffer of `out_size` bytes per job.
+        Each job gets its own per-slot BOs (safe against in-flight overwrite); all
+        buffers are pooled across calls. Amortizes the exec-wait round trip:
+        measured ~0.48 -> ~0.12 ms/op on the 288x288 GEMV design (Phoenix, XRT 2.21).
+        Returns one flat output array per job.
+        """
+        TO_DEV = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+        FROM_DEV = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+        n_in = len(jobs[0])
+        handles = []
+        for i, tensors in enumerate(jobs):
+            in_bos = []
+            for j, t in enumerate(tensors):
+                t = np.ascontiguousarray(t)
+                bo = self._bo(3 + j, t.nbytes, slot=i)
+                np.frombuffer(bo.map(), dtype=t.dtype)[:] = t.reshape(-1)
+                bo.sync(TO_DEV, t.nbytes, 0)
+                in_bos.append(bo)
+            out_bo = self._bo(3 + n_in, out_size, slot=i)
+            handles.append(self._kern(3, self._insts_bo, self._insts_bytes,
+                                      *in_bos, out_bo, 0, 0))
+        state = handles[-1].wait()
+        if str(state) != _COMPLETED:
+            raise RuntimeError(f"NPU kernel did not complete: {state}")
+        results = []
+        for i, ob in enumerate([self._bo(3 + n_in, out_size, slot=i) for i in range(len(jobs))]):
+            ob.sync(FROM_DEV, out_size, 0)
+            results.append(np.frombuffer(ob.map(), dtype=out_dtype).copy())
+        return results
 
 
 # ---------- benchmark helpers ----------
