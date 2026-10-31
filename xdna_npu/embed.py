@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 
 # Python that the AMD cp312 wheels require.
@@ -61,22 +62,26 @@ class EpProbe:
 
 def _find_python312() -> str | None:
     """Find a CPython 3.12 interpreter (system or uv-managed)."""
-    running_version = sys.version_info
-    if (3, 12) == (running_version.major, running_version.minor):
+    if (3, 12) == (sys.version_info.major, sys.version_info.minor):
         return sys.executable
     try:
-        cand = "python3.12"
-        out = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=5)
-        if next((s for s in out.split(" ") if s.startswith("3.12")), None) is not None:
-            return cand
+        out = subprocess.run(["python3.12", "--version"], capture_output=True, text=True, timeout=5)
+        version = (out.stdout + out.stderr).strip().split(" ")[-1]
+        if version.startswith("3.12"):
+            return "python3.12"
     except Exception:
         pass
     # uv-managed
     import glob
     uv = shutil.which("uv")
     if uv:
-        uv_dir = subprocess.run(["uv","python","dir"], capture_output=True, text=True, timeout=5)
-        for p in glob.glob(os.path.expanduser(f"{uv_dir}/cpython-3.12*/bin/python3.12")):
+        try:
+            base = subprocess.run(["uv", "python", "dir"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            base = ""
+        base = base or os.path.expanduser("~/.local/share/uv/python")
+        for p in sorted(glob.glob(os.path.join(base, "cpython-3.12*/bin/python3.12"))):
             return p
     return None
 
@@ -86,8 +91,7 @@ def site_packages_of(python: str) -> str | None:
         out = subprocess.run([python, "-c", "import site;print(site.getsitepackages()[0])"],
                              capture_output=True, text=True, timeout=10).stdout.strip()
         return out or None
-    except Exception as e:
-        print(e)
+    except Exception:
         return None
 
 
@@ -138,13 +142,14 @@ def probe_ep(python: str | None = None) -> EpProbe:
 
     if not_installed:
         if not site:
-            msgs.append(f"Unable to file site-packages directory for {python}")
+            msgs.append(f"Unable to find site-packages directory for {python}")
         else:
             msgs.append(f"AMD VitisAI stack not installed in this interpreter site-packages directory ({site}). Run "
                         "`xdna-npu embed-setup` (or see README) to install it from pypi.amd.com.")
         return EpProbe(False, False, [], False, msgs, False)
 
     env = ep_env(python)
+    tmp = tempfile.mkdtemp(prefix="xdna-probe-")
     probe = (
         "import onnxruntime as ort, os\n"
         "avps = ort.get_available_providers()\n"
@@ -154,7 +159,7 @@ def probe_ep(python: str | None = None) -> EpProbe:
         "ok=False; msg=''\n"
         "try:\n"
         "    s = ort.InferenceSession('TINY', so, providers=['VitisAIExecutionProvider'],\n"
-        "        provider_options=[{'config_file':'','cache_dir':'/tmp/xdna-ep-cache'}])\n"
+        "        provider_options=[{'config_file':'','cache_dir':'CACHE'}])\n"
         "    print('__SESS__', ','.join(s.get_providers())); ok=True\n"
         "except Exception as e:\n"
         "    msg = str(e); print('__ERR__', msg[:600])\n"
@@ -169,37 +174,43 @@ def probe_ep(python: str | None = None) -> EpProbe:
         "Y=helper.make_tensor_value_info('y',TensorProto.FLOAT,[8,8])\n"
         "g=helper.make_graph([helper.make_node('MatMul',['x','w'],['t']),helper.make_node('Add',['t','b'],['y'])],'g',[X],[Y],[W,B])\n"
         "m=helper.make_model(g,opset_imports=[helper.make_opsetid('',13)]); m.ir_version=9\n"
-        "onnx.save(m,'/tmp/xdna_tiny.onnx')\n"
+        "onnx.save(m,'MODEL')\n"
     )
-    command = [python, "-c", setup + probe.replace("'TINY'", "'/tmp/xdna_tiny.onnx'")]
-    proc = subprocess.run(
-        command,
-        capture_output=True, text=True, env=env, timeout=240,
-    )
-    out = proc.stdout + proc.stderr
-    msgs.append(out.strip()[:1200])
-    avps = []
-    sess_providers: list[str] = []
-    err = ""
-    for line in out.splitlines():
-        if line.startswith("__AVPS__"):
-            avps = [p.strip() for p in line.split("__AVPS__", 1)[1].split(",") if p.strip()]
-        elif line.startswith("__SESS__"):
-            sess_providers = [p.strip() for p in line.split("__SESS__", 1)[1].split(",") if p.strip()]
-        elif line.startswith("__ERR__"):
-            err = line.split("__ERR__", 1)[1].strip()
-    vitisai = "VitisAIExecutionProvider" in avps
-    initialized = "VitisAIExecutionProvider" in sess_providers
-    deploy_only = "deployment only installation" in err.lower() or "deployment only" in out.lower()
-    compile_supported = initialized and not deploy_only
-    if err and not initialized:
-        msgs.append(f"EP error: {err[:400]}")
-    if deploy_only:
-        msgs.append("Note: this is the deployment-only build (cannot compile models "
-                    "at runtime). Pre-compiled PHX models run; compiling your own needs "
-                    "AMD's account-gated Ryzen AI installer.")
-    return EpProbe(vitisai, initialized, sess_providers or avps, compile_supported,
-                   msgs, deploy_only)
+    script = (setup + probe).replace("'MODEL'", repr(os.path.join(tmp, "tiny.onnx"))) \
+                            .replace("'CACHE'", repr(os.path.join(tmp, "ep-cache")))
+    try:
+        try:
+            proc = subprocess.run([python, "-c", script],
+                                  capture_output=True, text=True, env=env, timeout=240)
+        except subprocess.TimeoutExpired:
+            msgs.append(f"EP probe timed out after 240 s (VitisAI EP hung under {python}?).")
+            return EpProbe(False, False, [], False, msgs, False)
+        out = proc.stdout + proc.stderr
+        msgs.append(out.strip()[-1200:])
+        avps = []
+        sess_providers: list[str] = []
+        err = ""
+        for line in out.splitlines():
+            if line.startswith("__AVPS__"):
+                avps = [p.strip() for p in line.split("__AVPS__", 1)[1].split(",") if p.strip()]
+            elif line.startswith("__SESS__"):
+                sess_providers = [p.strip() for p in line.split("__SESS__", 1)[1].split(",") if p.strip()]
+            elif line.startswith("__ERR__"):
+                err = line.split("__ERR__", 1)[1].strip()
+        vitisai = "VitisAIExecutionProvider" in avps
+        initialized = "VitisAIExecutionProvider" in sess_providers
+        deploy_only = "deployment only installation" in err.lower() or "deployment only" in out.lower()
+        compile_supported = initialized and not deploy_only
+        if err and not initialized:
+            msgs.append(f"EP error: {err[:400]}")
+        if deploy_only:
+            msgs.append("Note: this is the deployment-only build (cannot compile models "
+                        "at runtime). Pre-compiled PHX models run; compiling your own needs "
+                        "AMD's account-gated Ryzen AI installer.")
+        return EpProbe(vitisai, initialized, sess_providers or avps, compile_supported,
+                       msgs, deploy_only)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def status_line(p: EpProbe) -> str:
