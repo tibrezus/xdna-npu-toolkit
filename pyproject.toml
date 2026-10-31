@@ -34,7 +34,8 @@ serve = [
     "ml_dtypes",   # bfloat16 numpy dtype
 ]
 # NPU execution additionally needs: pyxrt (Arch 'xrt' pkg, on PYTHONPATH) and
-# mlir-aie (IRON) wheels for the compiled-GEMM runtime. See docs/SETUP.md.
+# mlir-aie (IRON) wheels for the compiled-GEMM runtime. See the project wiki
+# (https://github.com/tibrezus/xdna-npu-toolkit/wiki).
 
 [project.scripts]
 xdna-npu = "xdna_npu.cli:main"

@@ -13,6 +13,10 @@ open tool *can* — see [Why can't I run LLMs on my XDNA 1 NPU?](#why-cant-i-run
 below. This toolkit is the honest, working layer *underneath* that: it gets the NPU
 fully enabled and tells you exactly what is and isn't possible on your silicon.
 
+Deep-dive documentation (embeddings on XDNA 1, model compilation, the
+embed-runner, benchmarks) lives in the
+[wiki](https://github.com/tibrezus/xdna-npu-toolkit/wiki).
+
 ---
 
 ## What it does

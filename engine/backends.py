@@ -4,7 +4,7 @@ Three backends behind one interface (`embed(texts) -> np.ndarray [N, dim]`):
 
   CpuBackend   torch CPU bf16, ANY HuggingFace model. Correct per-model pooling
                (mean / last_token / cls). This is the speed winner on this
-               Zen 4 box vs the NPU1 (see docs/CRITICAL-CORRECTION.md).
+               Zen 4 box vs the NPU1 (see wiki: Benchmarks).
   NpuBackend   AMD XDNA1 NPU via IRON bf16 GEMMs. Dispatches to a model-specific
                adapter (minilm / qwen) that wraps the hand-written forward. Only
                works for registered, pre-compiled models — the NPU is not a

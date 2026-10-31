@@ -76,7 +76,8 @@ auto->cpu       64     1.26       80.9   384   <- auto calibrated, picked CPU
 ```
 
 On this 8-core Zen 4 with native AVX-512 BF16 + oneDNN, **torch CPU bf16 beats
-the ~10 TOPS NPU1 for dense embedding GEMM** (see `docs/CRITICAL-CORRECTION.md`).
+the ~10 TOPS NPU1 for dense embedding GEMM** (see the
+[Benchmarks wiki page](https://github.com/tibrezus/xdna-npu-toolkit/wiki/Benchmarks)).
 `auto` measures this itself and picks the winner. The NPU remains valuable for
 **power efficiency / CPU offload** — use `-b npu` explicitly when you want to
 free the CPU or run on battery, even if wall-clock is slower.

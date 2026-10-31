@@ -1,6 +1,6 @@
 """npu_server.py — a batched embedding-serving scaffold for the Phoenix NPU.
 
-Implements the architecture from iron/docs/ARCHITECTURE.md:
+Implements the architecture from iron/ARCHITECTURE.md:
   - accumulate queries into a batch
   - above a threshold, dispatch as ONE big GEMM to the NPU (264 GOPS path)
   - below it, run on CPU (avoids the host<->NPU round-trip tax)
