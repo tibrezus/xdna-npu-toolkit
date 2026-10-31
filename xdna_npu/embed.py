@@ -61,18 +61,22 @@ class EpProbe:
 
 def _find_python312() -> str | None:
     """Find a CPython 3.12 interpreter (system or uv-managed)."""
-    for cand in (sys.executable, "python3.12", "python3.12"):
-        try:
-            out = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=5)
-            if out.stdout.strip().endswith("3.12") or out.stdout.strip().endswith("3.12.13"):
-                return cand
-        except Exception:
-            pass
+    running_version = sys.version_info
+    if (3, 12) == (running_version.major, running_version.minor):
+        return sys.executable
+    try:
+        cand = "python3.12"
+        out = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=5)
+        if next((s for s in out.split(" ") if s.startswith("3.12")), None) is not None:
+            return cand
+    except Exception:
+        pass
     # uv-managed
     import glob
     uv = shutil.which("uv")
     if uv:
-        for p in glob.glob(os.path.expanduser("~/.local/share/uv/python/cpython-3.12*/bin/python3.12")):
+        uv_dir = subprocess.run(["uv","python","dir"], capture_output=True, text=True, timeout=5)
+        for p in glob.glob(os.path.expanduser(f"{uv_dir}/cpython-3.12*/bin/python3.12")):
             return p
     return None
 
@@ -82,7 +86,8 @@ def site_packages_of(python: str) -> str | None:
         out = subprocess.run([python, "-c", "import site;print(site.getsitepackages()[0])"],
                              capture_output=True, text=True, timeout=10).stdout.strip()
         return out or None
-    except Exception:
+    except Exception as e:
+        print(e)
         return None
 
 
@@ -129,9 +134,14 @@ def probe_ep(python: str | None = None) -> EpProbe:
         return EpProbe(False, False, [], False, msgs, False)
 
     site = site_packages_of(python)
-    if not site or not os.path.isdir(os.path.join(site, "voe")):
-        msgs.append("AMD VitisAI stack not installed in this interpreter. Run "
-                    "`xdna-npu embed-setup` (or see README) to install it from pypi.amd.com.")
+    not_installed = not site or not os.path.isdir(os.path.join(site, "voe"))
+
+    if not_installed:
+        if not site:
+            msgs.append(f"Unable to file site-packages directory for {python}")
+        else:
+            msgs.append(f"AMD VitisAI stack not installed in this interpreter site-packages directory ({site}). Run "
+                        "`xdna-npu embed-setup` (or see README) to install it from pypi.amd.com.")
         return EpProbe(False, False, [], False, msgs, False)
 
     env = ep_env(python)
@@ -161,12 +171,13 @@ def probe_ep(python: str | None = None) -> EpProbe:
         "m=helper.make_model(g,opset_imports=[helper.make_opsetid('',13)]); m.ir_version=9\n"
         "onnx.save(m,'/tmp/xdna_tiny.onnx')\n"
     )
+    command = [python, "-c", setup + probe.replace("'TINY'", "'/tmp/xdna_tiny.onnx'")]
     proc = subprocess.run(
-        [python, "-c", setup + probe.replace("'TINY'", "'/tmp/xdna_tiny.onnx'")],
+        command,
         capture_output=True, text=True, env=env, timeout=240,
     )
     out = proc.stdout + proc.stderr
-    msgs.append(out.strip()[-1200:])
+    msgs.append(out.strip()[:1200])
     avps = []
     sess_providers: list[str] = []
     err = ""
