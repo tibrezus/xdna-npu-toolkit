@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
 from . import __version__
 from .detect import detect
-from .embed import probe_ep, status_line as ep_status_line
+from .embed import probe_ep
 from .export_model import export_to_onnx
 from .runner import EmbedConfig, run_on_cpu, run_on_npu, status as runner_status
 from .enable import enable

@@ -45,11 +45,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 # Reuse the env/loc helpers from embed.py (kept cohesive).
 from .embed import (
-    AMD_INDEX,
     _find_python312,
     ep_env,
     site_packages_of,

@@ -14,10 +14,7 @@ on a 7840HS) via ROCm/HIP, not the NPU.
 
 from __future__ import annotations
 
-import glob
-import os
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass
 
