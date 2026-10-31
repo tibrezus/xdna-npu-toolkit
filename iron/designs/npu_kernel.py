@@ -11,7 +11,7 @@ Usage:
     out = kern.run(A, B)              # A:[M,K] i16, B:[K,N] i16 -> out:[M,N] i32
 """
 from __future__ import annotations
-import os, re, time
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
